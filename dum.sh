@@ -1,18 +1,29 @@
 #!/bin/bash
 
+set -Eeuo pipefail
+umask 077
+
 # ==============================================================================
-# DEBIAN UPGRADE MONITOR v2.8
+# DEBIAN UPGRADE MONITOR v2.9
 # Written by 0xGuigui
 # ==============================================================================
 # System state monitoring script for pre/post upgrade.
 # Usage: sudo ./upgrade_monitor.sh
 # ==============================================================================
 
-set -u
-
 # --- CONFIGURATION ---
-VERSION="2.8"
+VERSION="2.9"
 STATE_DIR="/var/lib/debian-upgrade-monitor"
+DRY_RUN=0
+VERBOSE=0
+JSON_REPORT=""
+LOCK_FILE=""
+LOCK_FD=""
+LOCK_HELD=0
+CURRENT_STATUS="EXCELLENT"
+CLEANUP=0
+declare -a ISSUE_PENALTIES=()
+declare -a ISSUE_REASONS=()
 
 # Global Score (Starting at 100)
 SCORE=100
@@ -42,7 +53,254 @@ translate() {
     fi
 }
 
+usage() {
+    cat <<'EOF'
+Usage: ./upgrade_monitor.sh [options]
+
+Options:
+  --dry-run             Run in read-only mode (skip cleanup and interactive edits)
+  -v, --verbose        Enable verbose diagnostic output
+  --json-report PATH   Write JSON summary to the provided file
+  --state-dir PATH     Override the default state directory
+  --cleanup            Remove snapshots after analysis (legacy behavior)
+  -h, --help           Show this help text and exit
+EOF
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run)
+                DRY_RUN=1
+                ;;
+            -v|--verbose)
+                VERBOSE=1
+                ;;
+            --json-report)
+                if [ -z "${2:-}" ]; then
+                    echo "--json-report requires a path." >&2
+                    exit 1
+                fi
+                JSON_REPORT="$2"
+                shift
+                ;;
+            --state-dir)
+                if [ -z "${2:-}" ]; then
+                    echo "--state-dir requires a path." >&2
+                    exit 1
+                fi
+                STATE_DIR="$2"
+                shift
+                ;;
+            --cleanup)
+                CLEANUP=1
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                usage >&2
+                exit 1
+                ;;
+        esac
+        shift
+    done
+}
+
+validate_state_dir() {
+    if [ -z "$STATE_DIR" ]; then
+        echo "STATE_DIR cannot be empty." >&2
+        exit 1
+    fi
+    if [[ "$STATE_DIR" != /* ]]; then
+        echo "STATE_DIR must be an absolute path." >&2
+        exit 1
+    fi
+    if [ "$STATE_DIR" = "/" ]; then
+        echo "STATE_DIR cannot be /." >&2
+        exit 1
+    fi
+
+    if command -v python3 >/dev/null 2>&1; then
+        STATE_DIR=$(python3 - "$STATE_DIR" <<'PY'
+import os, sys
+print(os.path.abspath(sys.argv[1]))
+PY
+)
+    fi
+}
+
+prepare_state_dir() {
+    local mode="${1:-require}"
+    if [ -d "$STATE_DIR" ]; then
+        chmod 700 "$STATE_DIR"
+        chown root:root "$STATE_DIR" >/dev/null 2>&1 || true
+        return
+    fi
+
+    if [ "$mode" = "create" ]; then
+        install -d -m 700 "$STATE_DIR"
+        chown root:root "$STATE_DIR" >/dev/null 2>&1 || true
+    else
+        log_error "$(translate "State directory missing." "Répertoire d'état manquant.")"
+        exit 1
+    fi
+}
+
+compute_lock_file() {
+    local hashed
+    if command -v md5sum >/dev/null 2>&1; then
+        hashed=$(printf '%s' "$STATE_DIR" | md5sum | awk '{print $1}')
+    else
+        hashed=$(printf '%s' "$STATE_DIR" | cksum | awk '{print $1}')
+    fi
+    if [ -z "$hashed" ]; then
+        hashed="default"
+    fi
+    LOCK_FILE="/var/lock/debian-upgrade-monitor-${hashed}.lock"
+}
+
+acquire_lock() {
+    local lock_dir
+    lock_dir=$(dirname "$LOCK_FILE")
+    mkdir -p "$lock_dir"
+    exec {LOCK_FD}>"$LOCK_FILE"
+    if ! flock -n "$LOCK_FD"; then
+        echo "Another instance of the monitor is already running." >&2
+        exit 1
+    fi
+    LOCK_HELD=1
+}
+
+cleanup() {
+    local exit_code=$1
+    if [ "$LOCK_HELD" -eq 1 ] && [ -n "${LOCK_FD:-}" ]; then
+        flock -u "$LOCK_FD"
+        rm -f "$LOCK_FILE"
+    fi
+}
+
+on_error() {
+    local code=$1
+    local line=$2
+    local last_cmd=${BASH_COMMAND:-}
+    if [[ "$last_cmd" == exit* ]]; then
+        return
+    fi
+    log_error "$(translate "Unexpected error (code $code) at line $line." "Erreur inattendue (code $code) à la ligne $line.")"
+}
+
+escape_json_string() {
+    local input="$1"
+    input=${input//\\/\\\\}
+    input=${input//"/\\"}
+    input=${input//$'\n'/\\n}
+    input=${input//$'\r'/\\r}
+    printf '%s' "$input"
+}
+
+preview_change_sample() {
+    local -n arr_ref=$1
+    local limit=${2:-5}
+    local count=${#arr_ref[@]}
+    if [ "$count" -eq 0 ]; then
+        printf 'n/a'
+        return
+    fi
+    if [ "$VERBOSE" -eq 1 ] || [ "$count" -le "$limit" ]; then
+        printf '%s' "${arr_ref[*]}"
+    else
+        local snippet=("${arr_ref[@]:0:$limit}")
+        printf '%s...' "${snippet[*]}"
+    fi
+}
+
+write_json_report() {
+    local target="$1"
+    [ -z "$target" ] && return
+    local dir
+    dir=$(dirname "$target")
+    mkdir -p "$dir"
+
+    local issues_json="[]"
+    if [ ${#ISSUE_PENALTIES[@]} -gt 0 ]; then
+        local entries=()
+        local idx=0
+        for penalty in "${ISSUE_PENALTIES[@]}"; do
+            local reason="${ISSUE_REASONS[$idx]}"
+            local escaped_reason
+            escaped_reason=$(escape_json_string "$reason")
+            entries+=("{\"penalty\":$penalty,\"reason\":\"$escaped_reason\"}")
+            ((idx+=1))
+        done
+        local joined=$(printf '%s,' "${entries[@]}")
+        joined=${joined%,}
+        issues_json="[$joined]"
+    fi
+
+    cat >"$target" <<EOF
+{
+  "timestamp": "$(date --iso-8601=seconds)",
+  "score": $SCORE,
+  "status": "$CURRENT_STATUS",
+  "stateDirectory": "$STATE_DIR",
+  "issues": $issues_json
+}
+EOF
+    log_verbose "JSON report saved to $target"
+}
+
+report_package_changes() {
+    local prev_versions="$STATE_DIR/prev_pkg_versions"
+    local curr_versions="$STATE_DIR/curr_pkg_versions"
+
+    if [ ! -f "$prev_versions" ] || [ ! -f "$curr_versions" ]; then
+        log_warn "$(translate "Package version snapshot missing; skipping package diff." "Instantané des versions de paquets manquant ; comparaison ignorée.")"
+        return
+    fi
+
+    mapfile -t added_list < <(awk -F'\t' 'NR==FNR { prev[$1]=$2; next } { if (!($1 in prev)) print $1"="$2 }' "$prev_versions" "$curr_versions")
+    mapfile -t removed_list < <(awk -F'\t' 'NR==FNR { curr[$1]=$2; next } { if (!($1 in curr)) print $1"="$2 }' "$curr_versions" "$prev_versions")
+    mapfile -t changed_list < <(awk -F'\t' 'NR==FNR { prev[$1]=$2; next } ($1 in prev && prev[$1]!=$2) { print $1"="prev[$1]" -> "$2 }' "$prev_versions" "$curr_versions")
+
+    local added_count=${#added_list[@]}
+    local removed_count=${#removed_list[@]}
+    local changed_count=${#changed_list[@]}
+
+    if [ "$added_count" -gt 0 ]; then
+        local sample=$(preview_change_sample added_list)
+        log_warn "$(translate "$added_count packages newly installed: $sample" "$added_count paquets nouvellement installés : $sample")"
+    else
+        log_success "$(translate "No new packages installed since baseline." "Aucun nouveau paquet installé depuis la baseline.")"
+    fi
+
+    if [ "$removed_count" -gt 0 ]; then
+        local sample_rm=$(preview_change_sample removed_list)
+        log_warn "$(translate "$removed_count packages removed: $sample_rm" "$removed_count paquets supprimés : $sample_rm")"
+        update_score 3 "Packages Removed"
+    else
+        log_success "$(translate "No baseline packages were removed." "Aucun paquet de la baseline n'a été supprimé.")"
+    fi
+
+    if [ "$changed_count" -gt 0 ]; then
+        local sample_ch=$(preview_change_sample changed_list)
+        log_warn "$(translate "$changed_count packages changed versions: $sample_ch" "$changed_count paquets ont changé de version : $sample_ch")"
+        update_score 2 "Package Versions Changed"
+    else
+        log_success "$(translate "No package version drift detected." "Aucune dérive de version détectée.")"
+    fi
+}
+
 detect_ui_language
+
+parse_args "$@"
+validate_state_dir
+
+if [ -z "$JSON_REPORT" ]; then
+    JSON_REPORT="$STATE_DIR/last_report.json"
+fi
 
 # Force locale to C to avoid bugs (grep/sort/apt), display remains translated
 export LC_ALL=C
@@ -64,13 +322,22 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
+compute_lock_file
+acquire_lock
+trap 'cleanup $?' EXIT
+trap 'on_error $? $LINENO' ERR
+
 # --- SCORE FUNCTIONS ---
 
 update_score() {
     local penalty=$1
     local reason=$2
-    ((SCORE-=penalty))
+    SCORE=$((SCORE - penalty))
     if [ $SCORE -lt 0 ]; then SCORE=0; fi
+    if [ -n "$reason" ]; then
+        ISSUE_PENALTIES+=("$penalty")
+        ISSUE_REASONS+=("$reason")
+    fi
 }
 
 display_score() {
@@ -80,10 +347,21 @@ display_score() {
     
     local color=$GREEN
     local status
+    local status_key="EXCELLENT"
     status=$(translate "EXCELLENT" "EXCELLENT")
 
-    if [ $SCORE -lt 90 ]; then color=$YELLOW; status=$(translate "WARNING" "ATTENTION"); fi
-    if [ $SCORE -lt 70 ]; then color=$RED; status=$(translate "CRITICAL" "CRITIQUE"); fi
+    if [ $SCORE -lt 90 ]; then
+        color=$YELLOW
+        status=$(translate "WARNING" "ATTENTION")
+        status_key="WARNING"
+    fi
+    if [ $SCORE -lt 70 ]; then
+        color=$RED
+        status=$(translate "CRITICAL" "CRITIQUE")
+        status_key="CRITICAL"
+    fi
+
+    CURRENT_STATUS="$status_key"
 
     echo -e "$(translate "OVERALL SCORE" "SCORE GLOBAL") : ${color}${BOLD}${SCORE} / 100${NC} ($status)"
     
@@ -103,7 +381,7 @@ display_score() {
     fi
     
     # History
-    if [ -d "$STATE_DIR" ]; then
+    if [ -d "$STATE_DIR" ] && [ "$DRY_RUN" -eq 0 ]; then
         echo "$(date +'%Y-%m-%d %H:%M:%S') | SCORE=$SCORE | $status" >> "$STATE_DIR/history.log"
     fi
     echo "--------------------------------------------------------"
@@ -116,6 +394,7 @@ log_success() { echo -e "${GREEN}[OK]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[FAIL]${NC} $1"; }
 log_clean() { echo -e "${PURPLE}[CLEAN]${NC} $1"; }
+log_verbose() { if [ "$VERBOSE" -eq 1 ]; then echo -e "${CYAN}[VERBOSE]${NC} $1"; fi }
 
 print_header() {
     clear
@@ -192,7 +471,7 @@ smart_service_check() {
             echo -e "   -> ${CYAN}[MIGRATED]${NC} $old_svc $(translate "seems to be replaced by" "semble être devenu") ${GREEN}$candidate${NC}"
         else
             echo -e "   -> ${RED}[MISSING]  $old_svc${NC} $(translate "(No equivalent found)" "(Aucun équivalent trouvé)")"
-            ((truly_missing_count++))
+            ((truly_missing_count+=1))
         fi
 
     done <<< "$missing_list"
@@ -204,6 +483,10 @@ smart_service_check() {
 
 resolve_conflicts() {
     local conflicts="$1"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log_warn "$(translate "Dry-run mode: conflict resolver is disabled." "Mode simulation : le résolveur de conflits est désactivé.")"
+        return
+    fi
     echo -e "\n${BOLD}>>> $(translate "STARTING INTERACTIVE CONFLICT RESOLVER" "DÉMARRAGE DU RÉSOLVEUR INTERACTIF")${NC}"
     echo "$(translate "For each file, choose an action." "Pour chaque fichier, choisissez une action.")"
     
@@ -292,34 +575,37 @@ check_cleanup() {
     
     # 1. Autoremove check
     # Simulate (-s) and count lines starting with "Remv" (remove)
-    local autoremove_count=$(apt-get -s autoremove | grep "^Remv" | wc -l)
+    local autoremove_count
+    autoremove_count=$(apt-get -s autoremove | awk '/^Remv/{c++} END{print c+0}')
     
     if [ "$autoremove_count" -gt 0 ]; then
         log_clean "$(translate "$autoremove_count unused packages detected (orphan dependencies)." "$autoremove_count paquets inutiles détectés (dépendances orphelines).")"
         echo -e "   -> ${CYAN}$(translate "Tip: consider a backup first (e.g. apt-clone)." "Conseil : Pensez à faire un backup avant (ex: apt-clone).")${NC}"
         echo -e "   -> $(translate "Suggested command" "Commande suggérée") : ${BOLD}apt autoremove --purge${NC}"
         update_score 2 "Need Autoremove"
-        ((issues++))
+        ((issues+=1))
     else
         log_success "$(translate "No unused packages (Autoremove clean)." "Aucun paquet inutile (Autoremove propre).")"
     fi
 
     # 2. RC Packages (Residual Config)
     # These are packages that have been removed but their config files remain
-    local rc_count=$(dpkg -l | grep "^rc" | wc -l)
+    local rc_count
+    rc_count=$(dpkg -l | awk '/^rc/{c++} END{print c+0}')
     
     if [ "$rc_count" -gt 0 ]; then
         log_clean "$(translate "$rc_count 'ghost packages' (RC - Residual Config) detected." "$rc_count 'paquets fantômes' (RC - Residual Config) détectés.")"
         echo -e "   -> $(translate "Suggested command" "Commande suggérée") : ${BOLD}apt purge \$(dpkg -l | grep '^rc' | awk '{print \$2}')${NC}"
         update_score 1 "RC Packages"
-        ((issues++))
+        ((issues+=1))
     else
         log_success "$(translate "No configuration residues (RC clean)." "Aucun résidu de configuration (RC propre).")"
     fi
 
     # 3. Old Kernels
     # Count installed linux images
-    local kernel_count=$(dpkg -l | grep "linux-image-[0-9]" | grep "^ii" | wc -l)
+    local kernel_count
+    kernel_count=$(dpkg -l | awk '/^ii/ && /linux-image-[0-9]/{c++} END{print c+0}')
     if [ "$kernel_count" -gt 2 ]; then
         log_warn "$(translate "Several kernels installed: $kernel_count (may fill /boot)." "Nombreux noyaux installés : $kernel_count (Peut saturer /boot).")"
         echo -e "   -> $(translate "Suggested command" "Commande suggérée") : ${BOLD}apt autoremove --purge${NC} $(translate "(should clean them up)" "(devrait les nettoyer)")"
@@ -392,10 +678,13 @@ check_firewall() {
 
 collect_pre_upgrade() {
     print_header
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log_error "$(translate "Dry-run mode cannot initialize the baseline capture." "Le mode simulation ne peut pas initialiser la capture de référence.")"
+        exit 1
+    fi
     log_info "$(translate "No existing baseline. Starting pre-upgrade capture." "État initial inexistant. Démarrage de la capture pré-mise à jour.")"
     echo "$(translate "Storage directory" "Répertoire de stockage") : $STATE_DIR"
-    if ! mkdir -p "$STATE_DIR"; then log_error "$(translate "Failed to create" "Erreur création") $STATE_DIR"; exit 1; fi
-    chmod 700 "$STATE_DIR"
+    prepare_state_dir create
     echo "$VERSION" > "$STATE_DIR/script_version"
 
     log_info "$(translate "Saving OS and kernel versions..." "Sauvegarde version OS et Kernel...")"
@@ -409,6 +698,7 @@ collect_pre_upgrade() {
     get_mounts > "$STATE_DIR/prev_mounts"
     get_dns > "$STATE_DIR/prev_dns"
     get_packages > "$STATE_DIR/prev_packages"
+    dpkg-query -W -f '${Package}\t${Version}\n' | sort > "$STATE_DIR/prev_pkg_versions"
     ip route show > "$STATE_DIR/prev_routes"
 
     check_web_health > "$STATE_DIR/prev_web_health"
@@ -426,6 +716,7 @@ collect_pre_upgrade() {
 
 analyze_post_upgrade() {
     print_header
+    prepare_state_dir require
     STORED_VERSION=$(cat "$STATE_DIR/script_version" 2>/dev/null || echo "0.0")
     
     if [ "$STORED_VERSION" == "0.0" ]; then log_warn "$(translate "Capture from older script version. Data may be partial." "Capture ancienne version. Données partielles.")";
@@ -468,7 +759,8 @@ analyze_post_upgrade() {
         update_score 20 "Missing Mounts";
     else log_success "$(translate "Mounts OK." "Montages OK.")"; fi
     
-    DISK_FULL=$(df -h --output=pcent,target | grep -E '(100%|9[0-9]%)')
+    # Use awk to avoid grep exiting 1 (pipefail) when no disks are above 90%
+    DISK_FULL=$(df -h --output=pcent,target | awk 'NR>1 && $1+0 >= 90')
     if [ -n "$DISK_FULL" ]; then log_warn "$(translate "Disk >90%:" "Disque >90% :")\n${YELLOW}$DISK_FULL${NC}"; update_score 5 "Disk Full"; fi
 
     # 3. Core Services (INTELLIGENCE ADDED v2.4)
@@ -523,6 +815,11 @@ analyze_post_upgrade() {
             update_score 5 "PHP Modules Lost";
         fi
     else log_success "$(translate "PHP Version : $CURR_PHP_VER" "Version PHP : $CURR_PHP_VER")"; fi
+
+    echo -e "\n${BOLD}[4bis] $(translate "PACKAGES" "PAQUETS")${NC}"
+    get_packages > "$STATE_DIR/curr_packages"
+    dpkg-query -W -f '${Package}\t${Version}\n' | sort > "$STATE_DIR/curr_pkg_versions"
+    report_package_changes
 
     # 5. Databases
     echo -e "\n${BOLD}[5] $(translate "DATABASES" "BASES DE DONNÉES")${NC}"
@@ -580,10 +877,19 @@ analyze_post_upgrade() {
     else log_success "$(translate "No configuration conflicts." "Aucun conflit de configuration.")"; fi
 
     display_score
+    write_json_report "$JSON_REPORT"
     
-    # Keep history, clean up the rest
-    rm -f "$STATE_DIR"/prev_* "$STATE_DIR"/curr_* "$STATE_DIR"/temp_* "$STATE_DIR"/script_version
-    echo -e "$(translate "Done. Report saved to $STATE_DIR/history.log" "Terminé. Rapport sauvegardé dans $STATE_DIR/history.log")"
+    # Keep history, optional cleanup
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log_warn "$(translate "Dry-run mode: state snapshots preserved for review." "Mode simulation : instantanés conservés pour analyse.")"
+        echo -e "$(translate "Report generated without altering baseline." "Rapport généré sans modifier la baseline.")"
+    elif [ "$CLEANUP" -eq 1 ]; then
+        rm -f "$STATE_DIR"/prev_* "$STATE_DIR"/curr_* "$STATE_DIR"/temp_* "$STATE_DIR"/script_version
+        echo -e "$(translate "Done. Report saved to $STATE_DIR/history.log" "Terminé. Rapport sauvegardé dans $STATE_DIR/history.log")"
+    else
+        log_warn "$(translate "Snapshots preserved (use --cleanup to remove them)." "Instantanés conservés (utilisez --cleanup pour les supprimer).")"
+        echo -e "$(translate "Report saved; no files deleted." "Rapport sauvegardé ; aucun fichier supprimé.")"
+    fi
     echo "--------------------------------------------------------"
 }
 
