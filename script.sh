@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 
 # ==============================================================================
-# DEBIAN UPGRADE MONITOR v2.9.4
+# DEBIAN UPGRADE MONITOR v2.9.5
 # Written by 0xGuigui
 # ==============================================================================
 # System state monitoring script for pre/post upgrade.
@@ -12,7 +12,7 @@ umask 077
 # ==============================================================================
 
 # --- CONFIGURATION ---
-VERSION="2.9.4"
+VERSION="2.9.5"
 STATE_DIR="/var/lib/debian-upgrade-monitor"
 DRY_RUN=0
 VERBOSE=0
@@ -580,7 +580,14 @@ resolve_conflicts() {
             case "$choice" in 
                 d) if command -v colordiff >/dev/null 2>&1; then colordiff -u "$real_file" "$conflict_file" | less -R || true; else diff -u --color=auto "$real_file" "$conflict_file" | less -R || true; fi ;;
                 k) rm "$conflict_file"; log_success "$(translate "Cleaned." "Nettoyé.")"; break ;;
-                r) cp "$real_file" "$real_file.bak"; mv "$conflict_file" "$real_file"; log_success "$(translate "Updated." "Mis à jour.")"; break ;;
+                r)
+                    if [ -e "$real_file" ]; then
+                        cp "$real_file" "$real_file.bak"
+                    fi
+                    mv "$conflict_file" "$real_file"
+                    log_success "$(translate "Updated." "Mis à jour.")"
+                    break
+                    ;;
                 e) ${EDITOR:-nano} "$real_file" "$conflict_file"; echo -e "${YELLOW}$(translate "Handle the files manually." "Gérez les fichiers manuellement.")${NC}"; break ;;
                 s) echo " -> $(translate "Skipped." "Ignoré.")"; break ;;
                 q) echo " -> $(translate "Stopped." "Arrêt.")"; return ;;
