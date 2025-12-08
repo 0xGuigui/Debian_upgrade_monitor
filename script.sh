@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 
 # ==============================================================================
-# DEBIAN UPGRADE MONITOR v2.9.5
+# DEBIAN UPGRADE MONITOR v2.10
 # Written by 0xGuigui
 # ==============================================================================
 # System state monitoring script for pre/post upgrade.
@@ -12,11 +12,14 @@ umask 077
 # ==============================================================================
 
 # --- CONFIGURATION ---
-VERSION="2.9.5"
+VERSION="2.10"
 STATE_DIR="/var/lib/debian-upgrade-monitor"
 DRY_RUN=0
 VERBOSE=0
 JSON_REPORT=""
+STRICT_HTTP_CHECK="${STRICT_HTTP_CHECK:-0}" # Set to 1 to enforce strict HTTP regression detection
+HTTP_BASELINE_STATUS="NA"
+HTTP_CURRENT_STATUS="NA"
 LOCK_FILE=""
 LOCK_FD=""
 LOCK_HELD=0
@@ -245,14 +248,83 @@ cleanup() {
     fi
 }
 
+format_call_stack() {
+    local -a frames=()
+    local depth=${#FUNCNAME[@]}
+    local max_frames=8
+    for ((i=1; i < depth && i <= max_frames; i++)); do
+        local fname="${FUNCNAME[$i]:-main}"
+        local src="${BASH_SOURCE[$i]:-?}"
+        local lno="${BASH_LINENO[$i-1]:-?}"
+        frames+=("${fname}@${src}:${lno}")
+    done
+    local IFS=" -> "
+    echo "${frames[*]}"
+}
+
 on_error() {
     local code=$1
     local line=$2
     local last_cmd=${BASH_COMMAND:-}
+    local source_file="${BASH_SOURCE[1]:-$(basename "$0")}"
+    local func_name="${FUNCNAME[1]:-main}"
     if [[ "$last_cmd" == exit* ]]; then
         return
     fi
-    log_error "$(translate "Unexpected error (code $code) at line $line." "Erreur inattendue (code $code) à la ligne $line.")"
+    last_cmd=${last_cmd//$'\n'/ }
+    local trace
+    trace=$(format_call_stack)
+
+    local primary_msg
+    primary_msg=$(translate "Unexpected error (code $code) at line $line (function $func_name, file $source_file)." "Erreur inattendue (code $code) à la ligne $line (fonction $func_name, fichier $source_file).")
+
+    if declare -F log_error >/dev/null 2>&1; then
+        log_error "$primary_msg"
+    else
+        echo "[FAIL] $primary_msg" >&2
+    fi
+
+    if [ -n "$last_cmd" ]; then
+        local cmd_msg
+        cmd_msg=$(translate "Last command: $last_cmd" "Dernière commande : $last_cmd")
+        if declare -F log_warn >/dev/null 2>&1; then
+            log_warn "$cmd_msg"
+        else
+            echo "[WARN] $cmd_msg" >&2
+        fi
+    fi
+
+    if [ -n "$trace" ]; then
+        local stack_msg
+        stack_msg=$(translate "Call stack: $trace" "Pile d'appels : $trace")
+        if declare -F log_warn >/dev/null 2>&1; then
+            log_warn "$stack_msg"
+        else
+            echo "[WARN] $stack_msg" >&2
+        fi
+    fi
+
+    if [ -d "$STATE_DIR" ] && [ -w "$STATE_DIR" ]; then
+        local err_log="$STATE_DIR/error_last.log"
+        {
+            echo "timestamp=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "code=$code"
+            echo "line=$line"
+            echo "function=$func_name"
+            echo "file=$source_file"
+            echo "command=$last_cmd"
+            if [ -n "$trace" ]; then echo "stack=$trace"; fi
+            echo "pwd=$PWD"
+        } > "$err_log"
+
+        local file_msg
+        file_msg=$(translate "Detailed error context saved to $err_log" "Contexte d'erreur détaillé enregistré dans $err_log")
+        if declare -F log_info >/dev/null 2>&1; then
+            log_info "$file_msg"
+        else
+            echo "[INFO] $file_msg"
+        fi
+    fi
 }
 
 escape_json_string() {
@@ -288,6 +360,9 @@ write_json_report() {
     mkdir -p "$dir"
 
     local issues_json="[]"
+    local http_base_json http_curr_json
+    http_base_json=$(escape_json_string "$HTTP_BASELINE_STATUS")
+    http_curr_json=$(escape_json_string "$HTTP_CURRENT_STATUS")
     if [ ${#ISSUE_PENALTIES[@]} -gt 0 ]; then
         local entries=()
         local idx=0
@@ -309,6 +384,8 @@ write_json_report() {
   "score": $SCORE,
   "status": "$CURRENT_STATUS",
   "stateDirectory": "$STATE_DIR",
+  "httpBaseline": "$http_base_json",
+  "httpCurrent": "$http_curr_json",
   "issues": $issues_json
 }
 EOF
@@ -318,6 +395,7 @@ EOF
 report_package_changes() {
     local prev_versions="$STATE_DIR/prev_pkg_versions"
     local curr_versions="$STATE_DIR/curr_pkg_versions"
+    local pkg_report="$STATE_DIR/package_changes.log"
 
     if [ ! -f "$prev_versions" ] || [ ! -f "$curr_versions" ]; then
         log_warn "$(translate "Package version snapshot missing; skipping package diff." "Instantané des versions de paquets manquant ; comparaison ignorée.")"
@@ -353,6 +431,24 @@ report_package_changes() {
         update_score 2 "Package Versions Changed"
     else
         log_success "$(translate "No package version drift detected." "Aucune dérive de version détectée.")"
+    fi
+
+    if [ "$added_count" -gt 0 ] || [ "$removed_count" -gt 0 ] || [ "$changed_count" -gt 0 ]; then
+        {
+            echo "# Package changes ($(date --iso-8601=seconds))"
+            echo "Added ($added_count):"
+            if [ "$added_count" -gt 0 ]; then printf '%s\n' "${added_list[@]}"; else echo "- none -"; fi
+            echo ""
+            echo "Removed ($removed_count):"
+            if [ "$removed_count" -gt 0 ]; then printf '%s\n' "${removed_list[@]}"; else echo "- none -"; fi
+            echo ""
+            echo "Version changes ($changed_count):"
+            if [ "$changed_count" -gt 0 ]; then printf '%s\n' "${changed_list[@]}"; else echo "- none -"; fi
+        } > "$pkg_report"
+
+        log_info "$(translate "Full package diff saved to $pkg_report" "Diff complet des paquets enregistré dans $pkg_report")"
+        echo -e "   -> $(translate "Focus on removed packages first; reinstall anything critical." "Priorisez les paquets supprimés ; réinstallez ce qui est critique.")"
+        echo -e "   -> $(translate "Then review added packages to spot unwanted dependencies." "Puis passez les paquets ajoutés pour repérer des dépendances indésirables.")"
     fi
 }
 
@@ -447,7 +543,13 @@ display_score() {
     
     # History
     if [ -d "$STATE_DIR" ] && [ "$DRY_RUN" -eq 0 ]; then
-        echo "$(date +'%Y-%m-%d %H:%M:%S') | SCORE=$SCORE | $status" >> "$STATE_DIR/history.log"
+        local http_hist="HTTP=${HTTP_BASELINE_STATUS}->${HTTP_CURRENT_STATUS}"
+        local prev_ng="${PREV_NGINX:-NA}"
+        local prev_ap="${PREV_APACHE:-NA}"
+        local curr_ng="${CURR_NGINX:-NA}"
+        local curr_ap="${CURR_APACHE:-NA}"
+        local web_hist="NGINX=${prev_ng}->${curr_ng} APACHE=${prev_ap}->${curr_ap}"
+        echo "$(date +'%Y-%m-%d %H:%M:%S') | SCORE=$SCORE | $status | $http_hist | $web_hist" >> "$STATE_DIR/history.log"
     fi
     echo "--------------------------------------------------------"
 }
@@ -878,21 +980,102 @@ analyze_post_upgrade() {
 
     PREV_HTTP=$(get_val "$STATE_DIR/prev_web_health" "HTTP_LOCALHOST_CODE" "NA")
     CURR_HTTP=$(get_val "$STATE_DIR/curr_web_health" "HTTP_LOCALHOST_CODE" "NA")
-    if [ "$PREV_HTTP" == "NA" ]; then log_warn "$(translate "HTTP Code unknown." "Code HTTP inconnu.")"; elif [ "$PREV_HTTP" == "200" ] && [ "$CURR_HTTP" != "200" ]; then 
-        log_error "$(translate "HTTP regression: $CURR_HTTP" "Régression HTTP : $CURR_HTTP")"; 
-        update_score 15 "HTTP Regression";
-    else log_success "$(translate "HTTP Status : $CURR_HTTP" "Statut HTTP : $CURR_HTTP")"; fi
+    PREV_NGINX=$(get_val "$STATE_DIR/prev_web_health" "NGINX_INSTALLED" "0")
+    PREV_APACHE=$(get_val "$STATE_DIR/prev_web_health" "APACHE_INSTALLED" "0")
+    CURR_NGINX=$(get_val "$STATE_DIR/curr_web_health" "NGINX_INSTALLED" "0")
+    CURR_APACHE=$(get_val "$STATE_DIR/curr_web_health" "APACHE_INSTALLED" "0")
+
+    local prev_web=0 curr_web=0 prev_http_valid=0 needs_error=0
+    [[ "$PREV_NGINX" = "1" || "$PREV_APACHE" = "1" ]] && prev_web=1
+    [[ "$CURR_NGINX" = "1" || "$CURR_APACHE" = "1" ]] && curr_web=1
+    [[ "$PREV_HTTP" =~ ^[0-9]{3}$ && "$PREV_HTTP" != "000" ]] && prev_http_valid=1
+
+    HTTP_BASELINE_STATUS="$PREV_HTTP"
+    HTTP_CURRENT_STATUS="$CURR_HTTP"
+
+    log_verbose "HTTP baseline=$PREV_HTTP current=$CURR_HTTP prev_web=$prev_web curr_web=$curr_web strict=$STRICT_HTTP_CHECK"
+
+    local baseline_probe_missing=0
+    case "$PREV_HTTP" in
+        "NO_CURL"|"NA"|"") baseline_probe_missing=1 ;;
+    esac
+
+    if [[ "$CURR_HTTP" =~ ^0+$ ]] || [ "$CURR_HTTP" = "NO_CURL" ] || [ "$CURR_HTTP" = "NA" ] || [ -z "$CURR_HTTP" ]; then
+        if [ "$PREV_HTTP" = "200" ]; then
+            needs_error=1
+        elif [ "$STRICT_HTTP_CHECK" -eq 1 ] && [ "$prev_web" -eq 1 ] && [ "$prev_http_valid" -eq 1 ]; then
+            needs_error=1
+        fi
+
+        if [ "$needs_error" -eq 1 ]; then
+            if [ "$CURR_HTTP" = "NO_CURL" ]; then
+                log_error "$(translate "HTTP probe failed: curl missing while baseline had a web service." "Sonde HTTP échouée : curl manquant alors que la baseline avait un service web.")"
+                echo -e "   -> $(translate "Install curl to confirm the site is still reachable." "Installez curl pour vérifier que le site est toujours joignable.")"
+            else
+                log_error "$(translate "No HTTP response on http://localhost (code $CURR_HTTP) whereas baseline had a web service." "Aucune réponse HTTP sur http://localhost (code $CURR_HTTP) alors que la baseline avait un service web.")"
+                echo -e "   -> $(translate "Is your web server running/listening on port 80? Adjust check_web_health() if you use another URL." "Votre serveur web tourne-t-il/écoute-t-il sur le port 80 ? Adaptez check_web_health() si vous utilisez une autre URL.")"
+            fi
+            update_score 15 "HTTP Unreachable"
+        else
+            if [ "$CURR_HTTP" = "NO_CURL" ]; then
+                if [ "$baseline_probe_missing" -eq 1 ]; then
+                    log_warn "$(translate "HTTP probe unavailable: curl missing (baseline also had no probe; regression not assessed)." "Sonde HTTP indisponible : curl manquant (la baseline n'avait pas de sonde ; régression non évaluée).")"
+                    echo -e "   -> $(translate "Install curl if you want HTTP checks in the future." "Installez curl si vous souhaitez des contrôles HTTP à l'avenir.")"
+                else
+                    log_warn "$(translate "HTTP probe unavailable: curl missing (no web service in baseline)." "Sonde HTTP indisponible : curl manquant (aucun service web dans la baseline).")"
+                    echo -e "   -> $(translate "Install curl if you want HTTP checks in the future." "Installez curl si vous souhaitez des contrôles HTTP à l'avenir.")"
+                fi
+            else
+                if [ "$baseline_probe_missing" -eq 1 ]; then
+                    log_warn "$(translate "HTTP probe unavailable (code $CURR_HTTP) and baseline had no probe; regression cannot be asserted." "Sonde HTTP indisponible (code $CURR_HTTP) et la baseline n'avait pas de sonde ; impossible d'affirmer une régression.")"
+                    echo -e "   -> $(translate "Install curl and enable a web service if you expect HTTP checks." "Installez curl et activez un service web si vous attendez des contrôles HTTP.")"
+                else
+                    log_warn "$(translate "HTTP probe unavailable (code $CURR_HTTP) but no web service was present in baseline; ignoring regression." "Sonde HTTP indisponible (code $CURR_HTTP) mais aucun service web n'était présent dans la baseline ; régression ignorée.")"
+                    echo -e "   -> $(translate "If you expect HTTP checks, install curl and a web service, then rerun." "Si vous attendez un contrôle HTTP, installez curl et un service web puis relancez.")"
+                fi
+            fi
+        fi
+    elif [[ "$CURR_HTTP" =~ ^2[0-9][0-9]$ ]]; then
+        if [ "$PREV_HTTP" = "NA" ]; then
+            log_success "$(translate "HTTP Status : $CURR_HTTP (no baseline for comparison)" "Statut HTTP : $CURR_HTTP (pas de baseline pour comparer)")"
+        elif [ "$PREV_HTTP" != "$CURR_HTTP" ]; then
+            log_success "$(translate "HTTP Status : $CURR_HTTP (was $PREV_HTTP)" "Statut HTTP : $CURR_HTTP (ancien : $PREV_HTTP)")"
+        else
+            log_success "$(translate "HTTP Status : $CURR_HTTP" "Statut HTTP : $CURR_HTTP")"
+        fi
+    else
+        local http_msg
+        http_msg=$(translate "HTTP returned $CURR_HTTP (expected 200)." "HTTP a renvoyé $CURR_HTTP (200 attendu).")
+        if [ "$PREV_HTTP" = "200" ]; then
+            log_error "$http_msg"
+            update_score 15 "HTTP Regression"
+        else
+            if [ "$baseline_probe_missing" -eq 1 ]; then
+                log_warn "$(translate "$http_msg (baseline had no probe; regression not asserted)." "$http_msg (baseline sans sonde ; régression non affirmée).")"
+            else
+                log_warn "$http_msg"
+                update_score 5 "HTTP Non-200"
+            fi
+        fi
+        echo -e "   -> $(translate "Check web server logs and virtual host configuration." "Vérifiez les logs du serveur web et la configuration du vhost.")"
+    fi
 
     PREV_PHP_VER=$(get_val "$STATE_DIR/prev_php_health" "PHP_VERSION" "NONE")
     CURR_PHP_VER=$(get_val "$STATE_DIR/curr_php_health" "PHP_VERSION" "NONE")
-    if [ "$PREV_PHP_VER" == "NONE" ]; then log_warn "$(translate "PHP version unknown." "Version PHP inconnue.")"; elif [ "$PREV_PHP_VER" != "$CURR_PHP_VER" ]; then
+    if [ "$PREV_PHP_VER" == "NONE" ]; then
+        log_warn "$(translate "PHP version unknown." "Version PHP inconnue.")"
+        echo -e "   -> $(translate "No php binary detected. If you host PHP apps, install php-cli/php-fpm then rerun." "Pas de binaire php détecté. Si vous hébergez du PHP, installez php-cli/php-fpm puis relancez.")"
+    elif [ "$PREV_PHP_VER" != "$CURR_PHP_VER" ]; then
         log_warn "$(translate "PHP Changed : $PREV_PHP_VER -> $CURR_PHP_VER" "PHP modifié : $PREV_PHP_VER -> $CURR_PHP_VER")"
         MISSING_MODULES=$(get_diff "$STATE_DIR/prev_php_modules" "$STATE_DIR/curr_php_modules")
         if [ -n "$MISSING_MODULES" ]; then 
             log_error "$(translate "Missing PHP extensions:" "Extensions PHP perdues :")\n${RED}$MISSING_MODULES${NC}"; 
             update_score 5 "PHP Modules Lost";
+            echo -e "   -> $(translate "Reinstall missing extensions or enable the correct PHP version." "Réinstallez les extensions manquantes ou activez la bonne version de PHP.")"
         fi
-    else log_success "$(translate "PHP Version : $CURR_PHP_VER" "Version PHP : $CURR_PHP_VER")"; fi
+    else
+        log_success "$(translate "PHP Version : $CURR_PHP_VER" "Version PHP : $CURR_PHP_VER")"
+    fi
 
     echo -e "\n${BOLD}[4bis] $(translate "PACKAGES" "PAQUETS")${NC}"
     get_packages > "$STATE_DIR/curr_packages"
