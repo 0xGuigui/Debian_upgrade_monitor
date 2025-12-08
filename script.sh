@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 
 # ==============================================================================
-# DEBIAN UPGRADE MONITOR v2.10
+# DEBIAN UPGRADE MONITOR v2.11
 # Written by 0xGuigui
 # ==============================================================================
 # System state monitoring script for pre/post upgrade.
@@ -12,14 +12,16 @@ umask 077
 # ==============================================================================
 
 # --- CONFIGURATION ---
-VERSION="2.10"
+VERSION="2.11"
 STATE_DIR="/var/lib/debian-upgrade-monitor"
 DRY_RUN=0
 VERBOSE=0
 JSON_REPORT=""
 STRICT_HTTP_CHECK="${STRICT_HTTP_CHECK:-0}" # Set to 1 to enforce strict HTTP regression detection
+RESET_STATE=0
 HTTP_BASELINE_STATUS="NA"
 HTTP_CURRENT_STATUS="NA"
+DISABLED_SERVICES_LIST=""
 LOCK_FILE=""
 LOCK_FD=""
 LOCK_HELD=0
@@ -128,6 +130,7 @@ Options:
   -v, --verbose        Enable verbose diagnostic output
   --json-report PATH   Write JSON summary to the provided file
   --state-dir PATH     Override the default state directory
+  --reset-state        Delete the state directory and exit (use to restart baseline)
   --cleanup            Remove snapshots after analysis (legacy behavior)
   -h, --help           Show this help text and exit
 EOF
@@ -164,6 +167,9 @@ parse_args() {
             -h|--help)
                 usage
                 exit 0
+                ;;
+            --reset-state)
+                RESET_STATE=1
                 ;;
             *)
                 echo "Unknown option: $1" >&2
@@ -278,10 +284,12 @@ on_error() {
     local primary_msg
     primary_msg=$(translate "Unexpected error (code $code) at line $line (function $func_name, file $source_file)." "Erreur inattendue (code $code) à la ligne $line (fonction $func_name, fichier $source_file).")
 
-    if declare -F log_error >/dev/null 2>&1; then
+    if declare -F log_bug >/dev/null 2>&1; then
+        log_bug "$primary_msg"
+    elif declare -F log_error >/dev/null 2>&1; then
         log_error "$primary_msg"
     else
-        echo "[FAIL] $primary_msg" >&2
+        echo "[BUG] $primary_msg" >&2
     fi
 
     if [ -n "$last_cmd" ]; then
@@ -452,10 +460,32 @@ report_package_changes() {
     fi
 }
 
+reset_state_dir_and_exit() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "[FAIL] $(translate "Cannot reset state directory in dry-run mode." "Impossible de réinitialiser le répertoire d'état en mode simulation.")" >&2
+        exit 1
+    fi
+    if [ "$STATE_DIR" = "/" ]; then
+        echo "[FAIL] STATE_DIR cannot be /." >&2
+        exit 1
+    fi
+    if [ ! -d "$STATE_DIR" ]; then
+        echo "$(translate "State directory not found; nothing to reset." "Répertoire d'état introuvable ; rien à réinitialiser.")"
+        exit 0
+    fi
+    rm -rf "$STATE_DIR"
+    echo "$(translate "State directory reset. Re-run to capture a fresh baseline." "Répertoire d'état réinitialisé. Relancez pour capturer une nouvelle baseline.")"
+    exit 0
+}
+
 detect_ui_language
 
 parse_args "$@"
 validate_state_dir
+
+if [ "$RESET_STATE" -eq 1 ]; then
+    reset_state_dir_and_exit
+fi
 
 if [ -z "$JSON_REPORT" ]; then
     JSON_REPORT="$STATE_DIR/last_report.json"
@@ -559,7 +589,9 @@ display_score() {
 log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 log_success() { echo -e "${GREEN}[OK]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_error() { echo -e "${RED}[FAIL]${NC} $1"; }
+log_ko() { echo -e "${RED}[KO]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+log_bug() { echo -e "${PURPLE}[BUG]${NC} $1"; }
 log_clean() { echo -e "${PURPLE}[CLEAN]${NC} $1"; }
 log_verbose() { if [ "$VERBOSE" -eq 1 ]; then echo -e "${CYAN}[VERBOSE]${NC} $1"; fi }
 
@@ -594,7 +626,9 @@ get_val() {
 smart_service_check() {
     local missing_list="$1"
     local current_file="$2"
+    local units_file="$3"
     local truly_missing_count=0
+    local disabled_acc=""
 
     local current_services_content
     current_services_content=$(cat "$current_file")
@@ -606,6 +640,17 @@ smart_service_check() {
         
         local clean_name=$(echo "$old_svc" | sed -E 's/\.service$//')
         local stem=$(echo "$clean_name" | sed -E 's/[0-9\.]+//g; s/-//g; s/@.*//g')
+
+        local unit_state=""
+        if [ -n "$units_file" ] && [ -f "$units_file" ]; then
+            unit_state=$(awk -F'\t' -v svc="$old_svc" '$1==svc{print $2; exit}' "$units_file")
+        fi
+
+        if [ -n "$unit_state" ] && [ "$unit_state" != "enabled" ]; then
+            echo -e "   -> ${YELLOW}$(translate "[DISABLED]" "[DÉSACTIVÉ]")${NC} $old_svc $(translate "(Unit present but state: $unit_state)" "(Unité présente mais état : $unit_state)")"
+            disabled_acc+="$old_svc\t$unit_state\n"
+            continue
+        fi
 
         # HEURISTIC 0: Whitelist (Oneshot / Boot services)
         if [[ "$clean_name" =~ ^(sysstat|console-setup|keyboard-setup|kmod-static-nodes|systemd-sysusers|systemd-fsck|ifup|networking)$ ]]; then
@@ -649,6 +694,12 @@ smart_service_check() {
 
     done <<< "$missing_list"
 
+    if [ -n "$disabled_acc" ]; then
+        DISABLED_SERVICES_LIST=$(printf "%b" "$disabled_acc")
+    else
+        DISABLED_SERVICES_LIST=""
+    fi
+
     return $truly_missing_count
 }
 
@@ -663,10 +714,15 @@ resolve_conflicts() {
     echo -e "\n${BOLD}>>> $(translate "STARTING INTERACTIVE CONFLICT RESOLVER" "DÉMARRAGE DU RÉSOLVEUR INTERACTIF")${NC}"
     echo "$(translate "For each file, choose an action." "Pour chaque fichier, choisissez une action.")"
     
-    while IFS= read -r conflict_file; do
-        [ -z "$conflict_file" ] && continue
-        real_file="${conflict_file%.dpkg-*}"
-        real_file="${real_file%.ucf-*}"
+	    local skip_all=0
+	    while IFS= read -r conflict_file; do
+	        [ -z "$conflict_file" ] && continue
+	        if [ "$skip_all" -eq 1 ]; then
+	            echo " -> $(translate "Skipped (all)." "Ignoré (tout).") $conflict_file"
+	            continue
+	        fi
+	        real_file="${conflict_file%.dpkg-*}"
+	        real_file="${real_file%.ucf-*}"
 
         while true; do
             echo -e "\n--------------------------------------------------------"
@@ -674,7 +730,7 @@ resolve_conflicts() {
             echo -e "$(translate "NEW" "NOUVEAU") : ${YELLOW}$conflict_file${NC}"
             echo -e "$(translate "CURRENT" "ACTUEL")  : ${GREEN}$real_file${NC}"
             echo "--------------------------------------------------------"
-            echo -e "$(translate "[${BOLD}D${NC}] Diff  [${BOLD}K${NC}] Keep  [${BOLD}R${NC}] Replace  [${BOLD}E${NC}] Edit  [${BOLD}S${NC}] Skip  [${BOLD}Q${NC}] Quit" "[${BOLD}D${NC}] Diff  [${BOLD}K${NC}] Conserver  [${BOLD}R${NC}] Remplacer  [${BOLD}E${NC}] Éditer  [${BOLD}S${NC}] Passer  [${BOLD}Q${NC}] Quitter")"
+            echo -e "$(translate "[${BOLD}D${NC}] Diff  [${BOLD}K${NC}] Keep  [${BOLD}R${NC}] Replace  [${BOLD}E${NC}] Edit  [${BOLD}S${NC}] Skip  [${BOLD}A${NC}] Skip All  [${BOLD}Q${NC}] Quit" "[${BOLD}D${NC}] Diff  [${BOLD}K${NC}] Conserver  [${BOLD}R${NC}] Remplacer  [${BOLD}E${NC}] Éditer  [${BOLD}S${NC}] Passer  [${BOLD}A${NC}] Tout passer  [${BOLD}Q${NC}] Quitter")"
             
             if read -e -p "$(translate "Action? : " "Action ? : ")" choice < /dev/tty; then :; else echo "$(translate "TTY error." "Erreur TTY.")"; return; fi
             choice=${choice,,}; choice=${choice:0:1}
@@ -692,11 +748,68 @@ resolve_conflicts() {
                     ;;
                 e) ${EDITOR:-nano} "$real_file" "$conflict_file"; echo -e "${YELLOW}$(translate "Handle the files manually." "Gérez les fichiers manuellement.")${NC}"; break ;;
                 s) echo " -> $(translate "Skipped." "Ignoré.")"; break ;;
+                a) echo " -> $(translate "Skip all remaining conflicts." "Passer tous les conflits restants.")"; skip_all=1; break ;;
                 q) echo " -> $(translate "Stopped." "Arrêt.")"; return ;;
                 *) echo "$(translate "Invalid choice." "Choix invalide.")";;
             esac
         done
     done <<< "$conflicts"
+}
+
+# --- SERVICE REACTIVATOR ---
+
+reactivate_disabled_services() {
+    local svc_list="$1"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log_warn "$(translate "Dry-run mode: service reactivator is disabled." "Mode simulation : le réactivateur de services est désactivé.")"
+        return
+    fi
+    if [ -z "$svc_list" ]; then
+        return
+    fi
+
+    echo -e "\n${BOLD}>>> $(translate "DISABLED SERVICES DETECTED" "SERVICES DÉSACTIVÉS DÉTECTÉS")${NC}"
+    echo "$(translate "Choose an action per service." "Choisissez une action par service.")"
+
+    local skip_all=0
+    while IFS=$'\t' read -r svc state; do
+        [ -z "$svc" ] && continue
+        if [ "$skip_all" -eq 1 ]; then
+            echo " -> $(translate "Skipped (all)." "Ignoré (tout).") $svc"
+            continue
+        fi
+        echo -e "\n--------------------------------------------------------"
+        echo -e "$(translate "SERVICE" "SERVICE") : ${BOLD}$svc${NC}"
+        echo -e "$(translate "STATE" "ÉTAT")    : ${YELLOW}$state${NC}"
+        echo "--------------------------------------------------------"
+        echo -e "$(translate "[${BOLD}E${NC}] Enable+Start  [${BOLD}S${NC}] Skip  [${BOLD}A${NC}] Skip All  [${BOLD}Q${NC}] Quit" "[${BOLD}E${NC}] Activer+Démarrer  [${BOLD}S${NC}] Passer  [${BOLD}A${NC}] Tout passer  [${BOLD}Q${NC}] Quitter")"
+
+        if read -e -p "$(translate "Action? : " "Action ? : ")" choice < /dev/tty; then :; else echo "$(translate "TTY error." "Erreur TTY.")"; return; fi
+        choice=${choice,,}; choice=${choice:0:1}
+
+        case "$choice" in
+            e)
+                if command -v systemctl >/dev/null 2>&1; then
+                    systemctl unmask "$svc" >/dev/null 2>&1 || true
+                    if systemctl enable --now "$svc" >/dev/null 2>&1; then
+                        log_success "$(translate "Service re-enabled and started." "Service réactivé et démarré.")"
+                    else
+                        log_ko "$(translate "Failed to enable/start $svc (check logs)." "Impossible d'activer/démarrer $svc (voir les logs).")"
+                    fi
+                else
+                    if service "$svc" start >/dev/null 2>&1; then
+                        log_success "$(translate "Service started (SysV)." "Service démarré (SysV).")"
+                    else
+                        log_ko "$(translate "Failed to start $svc." "Échec du démarrage de $svc.")"
+                    fi
+                fi
+                ;;
+            s) echo " -> $(translate "Skipped." "Ignoré.")" ;;
+            a) echo " -> $(translate "Skip all remaining services." "Passer tous les services restants.")"; skip_all=1 ;;
+            q) echo " -> $(translate "Stopped." "Arrêt.")"; return ;;
+            *) echo "$(translate "Invalid choice." "Choix invalide.")" ;;
+        esac
+    done <<< "$svc_list"
 }
 
 # --- DATA COLLECTION FUNCTIONS ---
@@ -711,6 +824,18 @@ get_services() {
         service --status-all 2>&1 | grep "+" | awk '{print $4}' | sort
     else
         ls /etc/init.d/ 2>/dev/null | sort
+    fi
+}
+
+get_service_units() {
+    if command -v systemctl >/dev/null 2>&1; then
+        # name \t state (enabled/disabled/static/masked/...)
+        systemctl list-unit-files --type=service --all --no-legend --plain | awk '{print $1"\t"$2}' | sort
+    elif command -v service >/dev/null 2>&1; then
+        # Fallback: list init scripts as "unknown"
+        service --status-all 2>&1 | awk '{print $4"\tunknown"}' | sort
+    else
+        ls /etc/init.d/ 2>/dev/null | awk '{print $1"\tunknown"}' | sort
     fi
 }
 
@@ -873,6 +998,7 @@ collect_pre_upgrade() {
 
     log_info "$(translate "Running full inventory (Services, Ports, Web, PHP, DB, Firewall)..." "Inventaire complet (Services, Ports, Web, PHP, DB, Firewall)...")"
     get_services > "$STATE_DIR/prev_services"
+    get_service_units > "$STATE_DIR/prev_service_units"
     get_timers > "$STATE_DIR/prev_timers"
     get_ports > "$STATE_DIR/prev_ports"
     get_mounts > "$STATE_DIR/prev_mounts"
@@ -935,7 +1061,7 @@ analyze_post_upgrade() {
     MISSING_MOUNTS=$(get_diff "$STATE_DIR/prev_mounts" "$STATE_DIR/curr_mounts")
     if [ ! -f "$STATE_DIR/prev_mounts" ]; then log_warn "$(translate "Missing mount data." "Données Mounts manquantes.")";
     elif [ -n "$MISSING_MOUNTS" ]; then 
-        log_error "$(translate "Missing mount points:" "Points de montage disparus :")\n${RED}$MISSING_MOUNTS${NC}"; 
+        log_ko "$(translate "Missing mount points:" "Points de montage disparus :")\n${RED}$MISSING_MOUNTS${NC}"; 
         update_score 20 "Missing Mounts";
     else log_success "$(translate "Mounts OK." "Montages OK.")"; fi
     
@@ -946,11 +1072,12 @@ analyze_post_upgrade() {
     # 3. Core Services (INTELLIGENCE ADDED v2.4)
     echo -e "\n${BOLD}[3] $(translate "SERVICES & TIMERS" "SERVICES & TIMERS")${NC}"
     get_services > "$STATE_DIR/curr_services"
+    get_service_units > "$STATE_DIR/curr_service_units"
     MISSING_SERVICES=$(get_diff "$STATE_DIR/prev_services" "$STATE_DIR/curr_services")
     
     if [ -n "$MISSING_SERVICES" ]; then 
         missing_count=0
-        smart_service_check "$MISSING_SERVICES" "$STATE_DIR/curr_services" || missing_count=$?
+        smart_service_check "$MISSING_SERVICES" "$STATE_DIR/curr_services" "$STATE_DIR/curr_service_units" || missing_count=$?
         
         if [ $missing_count -eq 0 ]; then
              log_success "$(translate "All missing services look like migrations." "Toutes les disparitions semblent être des migrations.")"
@@ -958,6 +1085,13 @@ analyze_post_upgrade() {
              log_warn "$(translate "There are $missing_count services truly missing." "Il y a $missing_count services vraiment perdus.")"
              penalty=$((missing_count * 5))
              update_score $penalty "$missing_count Services Lost"
+        fi
+        if [ -n "$DISABLED_SERVICES_LIST" ]; then
+            echo -e "\n${BOLD}$(translate "Reactivate disabled services now?" "Réactiver les services désactivés maintenant ?")${NC}"
+            if read -e -p "$(translate "Reactivate? (y/N) : " "Réactiver ? (o/N) : ")" choice < /dev/tty; then
+                choice=${choice,,}
+                if [[ $choice =~ ^(o|y) ]]; then reactivate_disabled_services "$DISABLED_SERVICES_LIST"; fi
+            fi
         fi
     else 
         log_success "$(translate "Services OK (No change)." "Services OK (Aucun changement).")"
@@ -1009,10 +1143,10 @@ analyze_post_upgrade() {
 
         if [ "$needs_error" -eq 1 ]; then
             if [ "$CURR_HTTP" = "NO_CURL" ]; then
-                log_error "$(translate "HTTP probe failed: curl missing while baseline had a web service." "Sonde HTTP échouée : curl manquant alors que la baseline avait un service web.")"
+                log_ko "$(translate "HTTP probe failed: curl missing while baseline had a web service." "Sonde HTTP échouée : curl manquant alors que la baseline avait un service web.")"
                 echo -e "   -> $(translate "Install curl to confirm the site is still reachable." "Installez curl pour vérifier que le site est toujours joignable.")"
             else
-                log_error "$(translate "No HTTP response on http://localhost (code $CURR_HTTP) whereas baseline had a web service." "Aucune réponse HTTP sur http://localhost (code $CURR_HTTP) alors que la baseline avait un service web.")"
+                log_ko "$(translate "No HTTP response on http://localhost (code $CURR_HTTP) whereas baseline had a web service." "Aucune réponse HTTP sur http://localhost (code $CURR_HTTP) alors que la baseline avait un service web.")"
                 echo -e "   -> $(translate "Is your web server running/listening on port 80? Adjust check_web_health() if you use another URL." "Votre serveur web tourne-t-il/écoute-t-il sur le port 80 ? Adaptez check_web_health() si vous utilisez une autre URL.")"
             fi
             update_score 15 "HTTP Unreachable"
@@ -1047,7 +1181,7 @@ analyze_post_upgrade() {
         local http_msg
         http_msg=$(translate "HTTP returned $CURR_HTTP (expected 200)." "HTTP a renvoyé $CURR_HTTP (200 attendu).")
         if [ "$PREV_HTTP" = "200" ]; then
-            log_error "$http_msg"
+            log_ko "$http_msg"
             update_score 15 "HTTP Regression"
         else
             if [ "$baseline_probe_missing" -eq 1 ]; then
@@ -1069,7 +1203,7 @@ analyze_post_upgrade() {
         log_warn "$(translate "PHP Changed : $PREV_PHP_VER -> $CURR_PHP_VER" "PHP modifié : $PREV_PHP_VER -> $CURR_PHP_VER")"
         MISSING_MODULES=$(get_diff "$STATE_DIR/prev_php_modules" "$STATE_DIR/curr_php_modules")
         if [ -n "$MISSING_MODULES" ]; then 
-            log_error "$(translate "Missing PHP extensions:" "Extensions PHP perdues :")\n${RED}$MISSING_MODULES${NC}"; 
+            log_ko "$(translate "Missing PHP extensions:" "Extensions PHP perdues :")\n${RED}$MISSING_MODULES${NC}"; 
             update_score 5 "PHP Modules Lost";
             echo -e "   -> $(translate "Reinstall missing extensions or enable the correct PHP version." "Réinstallez les extensions manquantes ou activez la bonne version de PHP.")"
         fi
@@ -1088,7 +1222,7 @@ analyze_post_upgrade() {
     PREV_MYSQL=$(get_val "$STATE_DIR/prev_db_health" "MYSQL_PING" "NA")
     CURR_MYSQL=$(get_val "$STATE_DIR/curr_db_health" "MYSQL_PING" "NA")
     if [ "$PREV_MYSQL" == "OK" ] && [ "$CURR_MYSQL" != "OK" ]; then 
-        log_error "$(translate "MariaDB/MySQL: PING FAIL!" "MariaDB/MySQL : PING FAIL !")"; 
+        log_ko "$(translate "MariaDB/MySQL: PING FAIL!" "MariaDB/MySQL : PING FAIL !")"; 
         update_score 15 "DB Fail";
     else log_success "$(translate "DB Connectivity : OK" "Connectivité DB : OK")"; fi
 
@@ -1099,7 +1233,7 @@ analyze_post_upgrade() {
     CURR_NFT=$(get_val "$STATE_DIR/curr_firewall" "NFT_RULES_COUNT" "0")
     if [[ "$PREV_NFT" =~ ^[0-9]+$ ]] && [[ "$CURR_NFT" =~ ^[0-9]+$ ]]; then
         if [ "$CURR_NFT" -lt 5 ] && [ "$PREV_NFT" -gt 10 ]; then 
-            log_error "$(translate "DANGER: NFTables wiped!" "DANGER : NFTables purgé !")"; 
+            log_ko "$(translate "DANGER: NFTables wiped!" "DANGER : NFTables purgé !")"; 
             update_score 15 "Firewall Purged";
         else log_success "$(translate "Firewall rules : $CURR_NFT" "Règles firewall : $CURR_NFT")"; fi
     fi
@@ -1125,7 +1259,7 @@ analyze_post_upgrade() {
     CONFIG_DRIFT=$(find /etc -name "*.dpkg-*" -o -name "*.ucf-*" 2>/dev/null)
     if [ -n "$CONFIG_DRIFT" ]; then 
         drift_count=$(echo "$CONFIG_DRIFT" | wc -l)
-        log_error "$(translate "$drift_count conflicts detected." "$drift_count Conflits détectés.")";
+        log_ko "$(translate "$drift_count conflicts detected." "$drift_count Conflits détectés.")";
         penalty=$((drift_count * 2))
         update_score $penalty "Config Files"
 
