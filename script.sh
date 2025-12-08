@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 
 # ==============================================================================
-# DEBIAN UPGRADE MONITOR v2.11.1
+# DEBIAN UPGRADE MONITOR v2.11.2
 # Written by 0xGuigui
 # ==============================================================================
 # System state monitoring script for pre/post upgrade.
@@ -12,7 +12,7 @@ umask 077
 # ==============================================================================
 
 # --- CONFIGURATION ---
-VERSION="2.11.1"
+VERSION="2.11.2"
 STATE_DIR="/var/lib/debian-upgrade-monitor"
 DRY_RUN=0
 VERBOSE=0
@@ -1097,6 +1097,24 @@ analyze_post_upgrade() {
 
     get_timers > "$STATE_DIR/curr_timers"
     MISSING_TIMERS=$(get_diff "$STATE_DIR/prev_timers" "$STATE_DIR/curr_timers")
+    if [ -n "$MISSING_TIMERS" ]; then
+        local migrated_timer_msgs=""
+        local filtered_timers=""
+        while IFS= read -r timer; do
+            [ -z "$timer" ] && continue
+            if [ "$timer" = "mlocate.timer" ]; then
+                if grep -qx "plocate-updatedb.timer" "$STATE_DIR/curr_timers"; then
+                    migrated_timer_msgs+="   -> ${CYAN}[MIGRATED]${NC} mlocate.timer $(translate "seems to be replaced by" "semble être devenu") ${GREEN}plocate-updatedb.timer${NC}\n"
+                    continue
+                fi
+            fi
+            filtered_timers+="$timer"$'\n'
+        done <<< "$MISSING_TIMERS"
+        if [ -n "$migrated_timer_msgs" ]; then
+            echo -e "$migrated_timer_msgs"
+        fi
+        MISSING_TIMERS=$(printf "%s" "$filtered_timers" | sed '/^$/d')
+    fi
     if [ -n "$MISSING_TIMERS" ]; then
         log_warn "$(translate "Timers missing:" "Timers disparus :")\n${YELLOW}$MISSING_TIMERS${NC}"
         update_score 2 "Timers Lost"
