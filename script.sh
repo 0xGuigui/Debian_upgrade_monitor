@@ -12,7 +12,7 @@ umask 077
 # ==============================================================================
 
 # --- CONFIGURATION ---
-VERSION="2.11.3"
+VERSION="2.11.4"
 STATE_DIR="/var/lib/debian-upgrade-monitor"
 DRY_RUN=0
 VERBOSE=0
@@ -922,7 +922,32 @@ check_cleanup() {
         # No score penalty, just a warning
     fi
     
-    # 4. Reboot required?
+    # 4. Obsolete / Local Packages (~o)
+    if command -v apt >/dev/null 2>&1; then
+        # We use grep to filter actual package lines, ignoring "Listing..."
+        local obs_list
+        obs_list=$(apt list '~o' 2>/dev/null | grep -E '/.*\[.*\]' || true)
+        local obs_count
+        obs_count=$(echo "$obs_list" | grep -cve '^\s*$' || true)
+
+        if [ "$obs_count" -gt 0 ]; then
+            log_warn "$(translate "$obs_count obsolete/local packages detected (not in repos)." "$obs_count paquets obsolètes/locaux détectés (absents des dépôts).")"
+            echo -e "   -> $(translate "These are often leftovers from previous Debian versions." "Ce sont souvent des restes d'anciennes versions de Debian.")"
+            echo -e "   -> $(translate "Review them carefully before removal:" "Vérifiez-les attentivement avant suppression :")"
+            # Show a few examples
+            echo "$obs_list" | head -n 5 | sed 's/^/      /'
+            if [ "$obs_count" -gt 5 ]; then echo "      ..."; fi
+            
+            echo -e "   -> $(translate "Suggested cleanup (DANGEROUS - Check list first!):" "Nettoyage suggéré (DANGEREUX - Vérifiez la liste avant !) :")"
+            echo -e "      ${BOLD}apt purge \$(apt list '~o' 2>/dev/null | awk -F/ '/\// {print \$1}')${NC}"
+            update_score 2 "Obsolete Packages"
+            ((issues+=1))
+        else
+            log_success "$(translate "No obsolete/local packages found." "Aucun paquet obsolète/local trouvé.")"
+        fi
+    fi
+
+    # 5. Reboot required?
     if [ -f /var/run/reboot-required ]; then
         log_warn "$(translate "A system reboot is REQUIRED (/var/run/reboot-required present)." "Un redémarrage système est REQUIS (/var/run/reboot-required présent).")"
         update_score 5 "Reboot Required"
