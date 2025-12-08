@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 
 # ==============================================================================
-# DEBIAN UPGRADE MONITOR v2.11.2
+# DEBIAN UPGRADE MONITOR v2.11.3
 # Written by 0xGuigui
 # ==============================================================================
 # System state monitoring script for pre/post upgrade.
@@ -12,7 +12,7 @@ umask 077
 # ==============================================================================
 
 # --- CONFIGURATION ---
-VERSION="2.11.2"
+VERSION="2.11.3"
 STATE_DIR="/var/lib/debian-upgrade-monitor"
 DRY_RUN=0
 VERBOSE=0
@@ -679,16 +679,16 @@ smart_service_check() {
                 candidate=$(grep -Ei -m1 "php.*fpm" <<< "$current_services_content" || true)
             fi
             
-                if [ -z "$candidate" ]; then
-                    case "$stem" in
-                        "mysql") candidate=$(grep -Fi -m1 "mariadb" <<< "$current_services_content" || true) ;;
-                        "mariadb") candidate=$(grep -Fi -m1 "mysql" <<< "$current_services_content" || true) ;;
-                        "cron") candidate=$(grep -Fi -m1 "systemd-cron" <<< "$current_services_content" || true) ;;
-                        "ntp") candidate=$(grep -Fi -m1 "systemd-timesyncd" <<< "$current_services_content" || true) ;;
-                        "mlocate") candidate=$(grep -Ei -m1 "plocate|updatedb|ntp" <<< "$current_services_content" || true) ;;
-                    esac
-                fi
+            if [ -z "$candidate" ]; then
+                case "$stem" in
+                    "mysql") candidate=$(grep -Fi -m1 "mariadb" <<< "$current_services_content" || true) ;;
+                    "mariadb") candidate=$(grep -Fi -m1 "mysql" <<< "$current_services_content" || true) ;;
+                    "cron") candidate=$(grep -Fi -m1 "systemd-cron" <<< "$current_services_content" || true) ;;
+                    "ntp") candidate=$(grep -Fi -m1 "systemd-timesyncd" <<< "$current_services_content" || true) ;;
+                    "mlocate") candidate=$(grep -Ei -m1 "plocate|updatedb|ntp" <<< "$current_services_content" || true) ;;
+                esac
             fi
+        fi
 
         if [ -n "$candidate" ]; then
             echo -e "   -> ${CYAN}[MIGRATED]${NC} $old_svc $(translate "seems to be replaced by" "semble être devenu") ${GREEN}$candidate${NC}"
@@ -984,6 +984,22 @@ check_firewall() {
     else echo "NFT_RULES_COUNT=NA"; fi
 }
 
+check_failed_units() {
+    if command -v systemctl >/dev/null 2>&1; then
+        local failed_units
+        failed_units=$(systemctl list-units --state=failed --no-legend --plain)
+        if [ -n "$failed_units" ]; then
+            local count
+            count=$(echo "$failed_units" | wc -l)
+            log_ko "$(translate "$count systemd units in FAILED state." "$count unités systemd en état FAILED.")"
+            echo -e "${RED}$failed_units${NC}"
+            update_score $((count * 5)) "Failed Units"
+        else
+            log_success "$(translate "No failed systemd units." "Aucune unité systemd en échec.")"
+        fi
+    fi
+}
+
 # --- MODE 1: BEFORE UPGRADE (CAPTURE) ---
 
 collect_pre_upgrade() {
@@ -1095,6 +1111,8 @@ analyze_post_upgrade() {
         log_success "$(translate "Services OK (No change)." "Services OK (Aucun changement).")"
     fi
 
+    check_failed_units
+
     get_timers > "$STATE_DIR/curr_timers"
     MISSING_TIMERS=$(get_diff "$STATE_DIR/prev_timers" "$STATE_DIR/curr_timers")
     if [ -n "$MISSING_TIMERS" ]; then
@@ -1166,6 +1184,8 @@ analyze_post_upgrade() {
                 echo -e "   -> $(translate "Is your web server running/listening on port 80? Adjust check_web_health() if you use another URL." "Votre serveur web tourne-t-il/écoute-t-il sur le port 80 ? Adaptez check_web_health() si vous utilisez une autre URL.")"
             fi
             update_score 15 "HTTP Unreachable"
+        elif [ "$prev_web" -eq 0 ]; then
+            log_success "$(translate "No web server detected (consistent with baseline)." "Aucun serveur web détecté (conforme à la baseline).")"
         else
             if [ "$CURR_HTTP" = "NO_CURL" ]; then
                 if [ "$baseline_probe_missing" -eq 1 ]; then
@@ -1212,9 +1232,10 @@ analyze_post_upgrade() {
 
     PREV_PHP_VER=$(get_val "$STATE_DIR/prev_php_health" "PHP_VERSION" "NONE")
     CURR_PHP_VER=$(get_val "$STATE_DIR/curr_php_health" "PHP_VERSION" "NONE")
-    if [ "$PREV_PHP_VER" == "NONE" ]; then
-        log_warn "$(translate "PHP version unknown." "Version PHP inconnue.")"
-        echo -e "   -> $(translate "No php binary detected. If you host PHP apps, install php-cli/php-fpm then rerun." "Pas de binaire php détecté. Si vous hébergez du PHP, installez php-cli/php-fpm puis relancez.")"
+    if [ "$PREV_PHP_VER" == "NONE" ] && [ "$CURR_PHP_VER" == "NONE" ]; then
+        log_success "$(translate "PHP not installed (consistent with baseline)." "PHP non installé (conforme à la baseline).")"
+    elif [ "$PREV_PHP_VER" == "NONE" ]; then
+        log_success "$(translate "PHP newly installed: $CURR_PHP_VER" "PHP nouvellement installé : $CURR_PHP_VER")"
     elif [ "$PREV_PHP_VER" != "$CURR_PHP_VER" ]; then
         log_warn "$(translate "PHP Changed : $PREV_PHP_VER -> $CURR_PHP_VER" "PHP modifié : $PREV_PHP_VER -> $CURR_PHP_VER")"
         MISSING_MODULES=$(get_diff "$STATE_DIR/prev_php_modules" "$STATE_DIR/curr_php_modules")
