@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 
 # ==============================================================================
-# DEBIAN UPGRADE MONITOR v2.11
+# DEBIAN UPGRADE MONITOR v2.11.1
 # Written by 0xGuigui
 # ==============================================================================
 # System state monitoring script for pre/post upgrade.
@@ -12,7 +12,7 @@ umask 077
 # ==============================================================================
 
 # --- CONFIGURATION ---
-VERSION="2.11"
+VERSION="2.11.1"
 STATE_DIR="/var/lib/debian-upgrade-monitor"
 DRY_RUN=0
 VERBOSE=0
@@ -647,8 +647,12 @@ smart_service_check() {
         fi
 
         if [ -n "$unit_state" ] && [ "$unit_state" != "enabled" ]; then
-            echo -e "   -> ${YELLOW}$(translate "[DISABLED]" "[DÉSACTIVÉ]")${NC} $old_svc $(translate "(Unit present but state: $unit_state)" "(Unité présente mais état : $unit_state)")"
-            disabled_acc+="$old_svc\t$unit_state\n"
+            if [ "$unit_state" = "alias" ]; then
+                echo -e "   -> ${CYAN}$(translate "[ALIAS]" "[ALIAS]")${NC} $old_svc $(translate "(Unit is an alias; likely replaced or redirected)" "(Unité est un alias ; probablement remplacée ou redirigée)")"
+            else
+                echo -e "   -> ${YELLOW}$(translate "[DISABLED]" "[DÉSACTIVÉ]")${NC} $old_svc $(translate "(Unit present but state: $unit_state)" "(Unité présente mais état : $unit_state)")"
+                disabled_acc+="$old_svc\t$unit_state\n"
+            fi
             continue
         fi
 
@@ -675,15 +679,16 @@ smart_service_check() {
                 candidate=$(grep -Ei -m1 "php.*fpm" <<< "$current_services_content" || true)
             fi
             
-            if [ -z "$candidate" ]; then
-                case "$stem" in
-                    "mysql") candidate=$(grep -Fi -m1 "mariadb" <<< "$current_services_content" || true) ;;
-                    "mariadb") candidate=$(grep -Fi -m1 "mysql" <<< "$current_services_content" || true) ;;
-                    "cron") candidate=$(grep -Fi -m1 "systemd-cron" <<< "$current_services_content" || true) ;;
-                    "ntp") candidate=$(grep -Fi -m1 "systemd-timesyncd" <<< "$current_services_content" || true) ;;
-                esac
+                if [ -z "$candidate" ]; then
+                    case "$stem" in
+                        "mysql") candidate=$(grep -Fi -m1 "mariadb" <<< "$current_services_content" || true) ;;
+                        "mariadb") candidate=$(grep -Fi -m1 "mysql" <<< "$current_services_content" || true) ;;
+                        "cron") candidate=$(grep -Fi -m1 "systemd-cron" <<< "$current_services_content" || true) ;;
+                        "ntp") candidate=$(grep -Fi -m1 "systemd-timesyncd" <<< "$current_services_content" || true) ;;
+                        "mlocate") candidate=$(grep -Ei -m1 "plocate|updatedb|ntp" <<< "$current_services_content" || true) ;;
+                    esac
+                fi
             fi
-        fi
 
         if [ -n "$candidate" ]; then
             echo -e "   -> ${CYAN}[MIGRATED]${NC} $old_svc $(translate "seems to be replaced by" "semble être devenu") ${GREEN}$candidate${NC}"
@@ -1086,13 +1091,6 @@ analyze_post_upgrade() {
              penalty=$((missing_count * 5))
              update_score $penalty "$missing_count Services Lost"
         fi
-        if [ -n "$DISABLED_SERVICES_LIST" ]; then
-            echo -e "\n${BOLD}$(translate "Reactivate disabled services now?" "Réactiver les services désactivés maintenant ?")${NC}"
-            if read -e -p "$(translate "Reactivate? (y/N) : " "Réactiver ? (o/N) : ")" choice < /dev/tty; then
-                choice=${choice,,}
-                if [[ $choice =~ ^(o|y) ]]; then reactivate_disabled_services "$DISABLED_SERVICES_LIST"; fi
-            fi
-        fi
     else 
         log_success "$(translate "Services OK (No change)." "Services OK (Aucun changement).")"
     fi
@@ -1270,6 +1268,14 @@ analyze_post_upgrade() {
              if [[ $choice =~ ^(o|y) ]]; then resolve_conflicts "$CONFIG_DRIFT"; else echo "$(translate "Skipped." "Ignoré.")"; fi
         fi
     else log_success "$(translate "No configuration conflicts." "Aucun conflit de configuration.")"; fi
+
+    if [ -n "$DISABLED_SERVICES_LIST" ]; then
+        echo -e "\n${BOLD}$(translate "Reactivate disabled services now?" "Réactiver les services désactivés maintenant ?")${NC}"
+        if read -e -p "$(translate "Reactivate? (y/N) : " "Réactiver ? (o/N) : ")" choice < /dev/tty; then
+            choice=${choice,,}
+            if [[ $choice =~ ^(o|y) ]]; then reactivate_disabled_services "$DISABLED_SERVICES_LIST"; fi
+        fi
+    fi
 
     display_score
     write_json_report "$JSON_REPORT"
